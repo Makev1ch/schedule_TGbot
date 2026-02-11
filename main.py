@@ -1,3 +1,5 @@
+# === main.py — Финальная версия ===
+
 import asyncio
 import logging
 import json
@@ -24,12 +26,16 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
 
 
+# === Timezone ===
 try:
     IRKUTSK_TZ = ZoneInfo("Asia/Irkutsk")
 except ZoneInfoNotFoundError:
     IRKUTSK_TZ = timezone(timedelta(hours=8))
+
 BASE_SCHEDULE_URL = "https://www.istu.edu/schedule/"
 
+
+# === Buttons ===
 BTN_TODAY = "📆 На сегодня"
 BTN_TOMORROW = "⏭️ На завтра"
 BTN_THIS_WEEK = "📆 На текущую неделю"
@@ -41,7 +47,12 @@ BTN_PAGE_PREV = "⬅️"
 BTN_PAGE_NEXT = "➡️"
 BTN_CANCEL = "❌ Отмена"
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or "0")
+ALL_BTNS = {
+    BTN_TODAY, BTN_TOMORROW, BTN_THIS_WEEK, BTN_NEXT_WEEK,
+    BTN_CHANGE_GROUP, BTN_REPORT, BTN_BACK, BTN_PAGE_PREV, BTN_PAGE_NEXT, BTN_CANCEL
+}
+
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or "1307617601")
 
 MENU_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -53,6 +64,7 @@ MENU_KB = ReplyKeyboardMarkup(
 )
 
 
+# === FSM ===
 class SetupFlow(StatesGroup):
     institute = State()
     course = State()
@@ -63,6 +75,7 @@ class ReportFlow(StatesGroup):
     report = State()
 
 
+# === Models ===
 @dataclass(frozen=True)
 class Institute:
     subdiv_id: int
@@ -91,246 +104,14 @@ class DaySchedule:
     lessons: list[Lesson]
 
 
-class UserSettingsStore:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._data: dict[str, Any] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if not self._path.exists():
-            self._data = {}
-            return
-        try:
-            self._data = json.loads(self._path.read_text(encoding="utf-8"))
-            if not isinstance(self._data, dict):
-                self._data = {}
-        except Exception:
-            self._data = {}
-
-    def _save(self) -> None:
-        self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def get(self, user_id: int) -> dict[str, Any]:
-        raw = self._data.get(str(user_id))
-        if isinstance(raw, dict):
-            return raw
-        return {}
-
-    def set(self, user_id: int, settings: dict[str, Any]) -> None:
-        self._data[str(user_id)] = settings
-        self._save()
+# === Helpers ===
+def iso_week_key(d: date) -> tuple[int, int]:
+    iso = d.isocalendar()
+    return iso.year, iso.week
 
 
-class ScheduleClient:
-    def __init__(self, session: aiohttp.ClientSession) -> None:
-        self._session = session
-        self._cache: dict[str, tuple[float, str]] = {}
-        self._parsed_cache: dict[str, tuple[float, tuple[bool, list[DaySchedule]]]] = {}
-        self._parsed_cache_ttl = float(os.getenv("SCHEDULE_PARSED_CACHE_TTL") or "120")
-        self._parsed_cache_max = int(os.getenv("SCHEDULE_PARSED_CACHE_MAX") or "256")
-        self._institutes_cache: Optional[list[Institute]] = None
-        self._groups_cache: dict[int, dict[int, list[Group]]] = {}
-
-    async def _get_text(self, url: str, params: Optional[dict[str, Any]] = None) -> str:
-        key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
-        now = asyncio.get_running_loop().time()
-        cached = self._cache.get(key)
-        if cached and now - cached[0] < 30:
-            return cached[1]
-        async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            resp.raise_for_status()
-            text = await resp.text()
-        self._cache[key] = (now, text)
-        return text
-
-    def _parsed_cache_key(self, group_id: int, target_date: date) -> str:
-        return f"{group_id}:{target_date.isoformat()}"
-
-    def _prune_parsed_cache(self) -> None:
-        if not self._parsed_cache:
-            return
-        now = asyncio.get_running_loop().time()
-        ttl = max(1.0, self._parsed_cache_ttl)
-
-        expired = [k for k, (ts, _) in self._parsed_cache.items() if now - ts > ttl]
-        for k in expired:
-            self._parsed_cache.pop(k, None)
-
-        max_items = max(1, self._parsed_cache_max)
-        if len(self._parsed_cache) <= max_items:
-            return
-
-        items = sorted(self._parsed_cache.items(), key=lambda kv: kv[1][0])
-        for k, _ in items[: max(0, len(items) - max_items)]:
-            self._parsed_cache.pop(k, None)
-
-    async def list_institutes(self) -> list[Institute]:
-        if self._institutes_cache is not None:
-            return self._institutes_cache
-        html = await self._get_text(BASE_SCHEDULE_URL)
-        soup = BeautifulSoup(html, "html.parser")
-
-        content = soup.select_one("div.content")
-        if content is None:
-            return []
-
-        institutes: dict[int, str] = {}
-        for a in content.select('a[href^="?subdiv="]'):
-            href = a.get("href") or ""
-            m = re.match(r"^\?subdiv=(\d+)$", href)
-            if not m:
-                continue
-            subdiv_id = int(m.group(1))
-            title = a.get_text(" ", strip=True)
-            if title:
-                institutes[subdiv_id] = title
-
-        self._institutes_cache = [Institute(subdiv_id=k, title=v) for k, v in institutes.items()]
-        self._institutes_cache.sort(key=lambda x: x.title.lower())
-        return self._institutes_cache
-
-    async def list_groups_by_course(self, subdiv_id: int) -> dict[int, list[Group]]:
-        cached = self._groups_cache.get(subdiv_id)
-        if cached is not None:
-            return cached
-
-        html = await self._get_text(BASE_SCHEDULE_URL, params={"subdiv": subdiv_id})
-        soup = BeautifulSoup(html, "html.parser")
-        kurs_list = soup.select_one("ul.kurs-list")
-        if kurs_list is None:
-            self._groups_cache[subdiv_id] = {}
-            return {}
-
-        by_course: dict[int, list[Group]] = {}
-
-        for li in kurs_list.find_all("li"):
-            ul = li.find("ul")
-            if ul is None:
-                continue
-            header = li.get_text(" ", strip=True)
-            m = re.match(r"^Курс\s*(\d+)\b", header)
-            if not m:
-                continue
-            course = int(m.group(1))
-
-            groups: list[Group] = []
-            for a in ul.select('a[href^="?group="]'):
-                href = a.get("href") or ""
-                mg = re.match(r"^\?group=(\d+)$", href)
-                if not mg:
-                    continue
-                group_id = int(mg.group(1))
-                title = a.get_text(" ", strip=True)
-                if title:
-                    groups.append(Group(group_id=group_id, title=title))
-            groups.sort(key=lambda g: g.title.lower())
-            if groups:
-                by_course[course] = groups
-
-        self._groups_cache[subdiv_id] = by_course
-        return by_course
-
-    async def get_week_schedule(self, group_id: int, target_date: date) -> tuple[bool, list[DaySchedule]]:
-        self._prune_parsed_cache()
-        cache_key = self._parsed_cache_key(group_id, target_date)
-        cached = self._parsed_cache.get(cache_key)
-        if cached is not None:
-            return cached[1]
-
-        html = await self._get_text(
-            BASE_SCHEDULE_URL,
-            params={"group": group_id, "date": f"{target_date.year}-{target_date.month}-{target_date.day}"},
-        )
-        soup = BeautifulSoup(html, "html.parser")
-
-        week_block = soup.select_one("#dateweek")
-        week_text = week_block.get_text(" ", strip=True).lower() if week_block else ""
-        if "нечет" in week_text or "нечёт" in week_text:
-            page_is_odd_week = True
-        elif "четн" in week_text or "чётн" in week_text:
-            page_is_odd_week = False
-        else:
-            page_is_odd_week = False
-
-        is_odd_week = not page_is_odd_week
-
-        content = soup.select_one("div.content")
-        if content is None:
-            return (is_odd_week, [])
-
-        days: list[DaySchedule] = []
-        for h in content.select("h3.day-heading"):
-            heading = h.get_text(" ", strip=True)
-            lines = h.find_next_sibling("div", class_="class-lines")
-            if lines is None:
-                continue
-
-            lessons: list[Lesson] = []
-            for item in lines.select("div.class-line-item"):
-                time_el = item.select_one("div.class-time")
-                if time_el is None:
-                    continue
-                start = _parse_time(time_el.get_text(" ", strip=True))
-                if start is None:
-                    continue
-
-                tails: list[Any] = []
-                tails.extend(item.select("div.class-tail.class-all-week"))
-
-                tail_selector = "div.class-tail.class-odd-week" if is_odd_week else "div.class-tail.class-even-week"
-                tail_week = item.select_one(tail_selector)
-                if tail_week is not None:
-                    tails.append(tail_week)
-
-                if not tails:
-                    continue
-
-                for tail in tails:
-                    if tail.get_text(" ", strip=True).lower() == "свободно":
-                        continue
-
-                    for subject_el in tail.select("div.class-pred"):
-                        subject = subject_el.get_text(" ", strip=True)
-                        if not subject:
-                            continue
-
-                        kind_info = subject_el.find_previous_sibling("div", class_="class-info")
-                        kind_text = kind_info.get_text(" ", strip=True) if kind_info else ""
-                        kind = _extract_lesson_kind(kind_text)
-
-                        teacher = "—"
-                        if kind_info is not None:
-                            teacher_links = kind_info.select('a[href^="?prep="]')
-                            teacher_names = [a.get_text(" ", strip=True) for a in teacher_links]
-                            teacher_names = [t for t in teacher_names if t]
-                            if teacher_names:
-                                teacher = ", ".join(teacher_names)
-
-                        group_info = _find_next_sibling(subject_el, "class-info")
-                        subgroup = _extract_subgroup(group_info.get_text(" ", strip=True) if group_info else "")
-
-                        aud_el = _find_next_sibling(subject_el, "class-aud")
-                        room = aud_el.get_text(" ", strip=True) if aud_el else "—"
-
-                        lessons.append(
-                            Lesson(
-                                start=start,
-                                subject=subject,
-                                kind=kind,
-                                subgroup=subgroup,
-                                room=room or "—",
-                                teacher=teacher or "—",
-                            )
-                        )
-
-            days.append(DaySchedule(heading=heading, lessons=lessons))
-
-        result = (is_odd_week, days)
-        now = asyncio.get_running_loop().time()
-        self._parsed_cache[cache_key] = (now, result)
-        self._prune_parsed_cache()
-        return result
+def is_odd_week(d: date) -> bool:
+    return d.isocalendar().week % 2 == 1
 
 
 def _parse_time(value: str) -> Optional[time]:
@@ -374,18 +155,8 @@ def _extract_lesson_kind(text: str) -> str:
 
 
 RU_MONTHS = {
-    "января": 1,
-    "февраля": 2,
-    "марта": 3,
-    "апреля": 4,
-    "мая": 5,
-    "июня": 6,
-    "июля": 7,
-    "августа": 8,
-    "сентября": 9,
-    "октября": 10,
-    "ноября": 11,
-    "декабря": 12,
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
 
 
@@ -514,6 +285,203 @@ def _paged_kb(
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
+async def safe_send(message: Message, text: str) -> None:
+    for i in range(0, len(text), 3800):
+        await message.answer(text[i : i + 3800])
+
+
+# === Store (async-safe) ===
+class UserSettingsStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = asyncio.Lock()
+        self._data: dict[str, Any] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            self._data = {}
+            return
+        try:
+            self._data = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(self._data, dict):
+                self._data = {}
+        except Exception:
+            self._data = {}
+
+    async def set(self, user_id: int, settings: dict[str, Any]) -> None:
+        async with self._lock:
+            self._data[str(user_id)] = settings
+            self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get(self, user_id: int) -> dict[str, Any]:
+        raw = self._data.get(str(user_id))
+        if isinstance(raw, dict):
+            return raw
+        return {}
+
+
+# === Schedule Client ===
+class ScheduleClient:
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._session = session
+        self._parsed_cache: dict[str, tuple[float, tuple[bool, list[DaySchedule]]]] = {}
+        self._parsed_cache_ttl = 120.0
+
+    def _prune(self) -> None:
+        now = asyncio.get_running_loop().time()
+        for k, (ts, _) in list(self._parsed_cache.items()):
+            if now - ts > self._parsed_cache_ttl:
+                self._parsed_cache.pop(k, None)
+
+    async def _get_text(self, url: str, params: dict[str, Any]) -> str:
+        async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            resp.raise_for_status()
+            return await resp.text()
+
+    async def list_institutes(self) -> list[Institute]:
+        html_page = await self._get_text(BASE_SCHEDULE_URL, {})
+        soup = BeautifulSoup(html_page, "html.parser")
+        content = soup.select_one("div.content")
+        if content is None:
+            raise RuntimeError("Schedule HTML structure changed: no div.content")
+
+        institutes: dict[int, str] = {}
+        for a in content.select('a[href^="?subdiv="]'):
+            href = a.get("href") or ""
+            m = re.match(r"^\?subdiv=(\d+)$", href)
+            if not m:
+                continue
+            subdiv_id = int(m.group(1))
+            title = a.get_text(" ", strip=True)
+            if title:
+                institutes[subdiv_id] = title
+
+        result = [Institute(subdiv_id=k, title=v) for k, v in institutes.items()]
+        result.sort(key=lambda x: x.title.lower())
+        return result
+
+    async def list_groups_by_course(self, subdiv_id: int) -> dict[int, list[Group]]:
+        html_page = await self._get_text(BASE_SCHEDULE_URL, {"subdiv": subdiv_id})
+        soup = BeautifulSoup(html_page, "html.parser")
+        kurs_list = soup.select_one("ul.kurs-list")
+        if kurs_list is None:
+            raise RuntimeError("Schedule HTML structure changed: no ul.kurs-list")
+
+        by_course: dict[int, list[Group]] = {}
+
+        for li in kurs_list.find_all("li"):
+            ul = li.find("ul")
+            if ul is None:
+                continue
+            header = li.get_text(" ", strip=True)
+            m = re.match(r"^Курс\s*(\d+)\b", header)
+            if not m:
+                continue
+            course = int(m.group(1))
+
+            groups: list[Group] = []
+            for a in ul.select('a[href^="?group="]'):
+                href = a.get("href") or ""
+                mg = re.match(r"^\?group=(\d+)$", href)
+                if not mg:
+                    continue
+                group_id = int(mg.group(1))
+                title = a.get_text(" ", strip=True)
+                if title:
+                    groups.append(Group(group_id=group_id, title=title))
+            groups.sort(key=lambda g: g.title.lower())
+            if groups:
+                by_course[course] = groups
+
+        return by_course
+
+    async def get_week_schedule(self, group_id: int, target_date: date) -> tuple[bool, list[DaySchedule]]:
+        self._prune()
+        year, week = iso_week_key(target_date)
+        cache_key = f"{group_id}:{year}:{week}"
+
+        cached = self._parsed_cache.get(cache_key)
+        if cached and isinstance(cached, tuple) and len(cached) == 2:
+            return cached[1]
+
+        html_page = await self._get_text(
+            BASE_SCHEDULE_URL,
+            {"group": group_id, "date": target_date.strftime("%Y-%m-%d")},
+        )
+
+        soup = BeautifulSoup(html_page, "html.parser")
+        content = soup.select_one("div.content")
+        if content is None:
+            raise RuntimeError("Schedule HTML structure changed: no div.content")
+
+        odd = is_odd_week(target_date)
+        days: list[DaySchedule] = []
+
+        for h in content.select("h3.day-heading"):
+            heading = h.get_text(" ", strip=True)
+            lines = h.find_next_sibling("div", class_="class-lines")
+            if not lines:
+                continue
+
+            lessons: list[Lesson] = []
+            for item in lines.select("div.class-line-item"):
+                time_el = item.select_one("div.class-time")
+                start = _parse_time(time_el.get_text(strip=True)) if time_el else None
+                if not start:
+                    continue
+
+                tails = list(item.select("div.class-tail.class-all-week"))
+                week_tail = item.select_one(
+                    "div.class-tail.class-odd-week" if odd else "div.class-tail.class-even-week"
+                )
+                if week_tail:
+                    tails.append(week_tail)
+
+                for tail in tails:
+                    if tail.get_text(" ", strip=True).lower() == "свободно":
+                        continue
+
+                    for subject_el in tail.select("div.class-pred"):
+                        subject = subject_el.get_text(" ", strip=True)
+                        if not subject:
+                            continue
+
+                        kind_info = subject_el.find_previous_sibling("div", class_="class-info")
+                        kind = _extract_lesson_kind(kind_info.get_text(" ", strip=True) if kind_info else "")
+
+                        teacher = "—"
+                        if kind_info:
+                            teacher_links = kind_info.select('a[href^="?prep="]')
+                            teacher_names = [a.get_text(" ", strip=True) for a in teacher_links if a.get_text(" ", strip=True)]
+                            if teacher_names:
+                                teacher = ", ".join(teacher_names)
+
+                        group_info = _find_next_sibling(subject_el, "class-info")
+                        subgroup = _extract_subgroup(group_info.get_text(" ", strip=True) if group_info else "")
+
+                        aud_el = _find_next_sibling(subject_el, "class-aud")
+                        room = aud_el.get_text(" ", strip=True) if aud_el else "—"
+
+                        lessons.append(
+                            Lesson(
+                                start=start,
+                                subject=subject,
+                                kind=kind,
+                                subgroup=subgroup,
+                                room=room or "—",
+                                teacher=teacher or "—",
+                            )
+                        )
+
+            days.append(DaySchedule(heading=heading, lessons=lessons))
+
+        result = (odd, days)
+        self._parsed_cache[cache_key] = (asyncio.get_running_loop().time(), result)
+        return result
+
+
+# === Handlers ===
 async def _ensure_user_ready(message: Message, store: UserSettingsStore) -> Optional[dict[str, Any]]:
     if message.from_user is None:
         return None
@@ -528,8 +496,10 @@ async def cmd_start(message: Message, state: FSMContext, schedules: ScheduleClie
     await state.clear()
     await state.set_state(SetupFlow.institute)
 
-    institutes = await schedules.list_institutes()
-    if not institutes:
+    try:
+        institutes = await schedules.list_institutes()
+    except Exception:
+        logging.exception("Failed to load institutes")
         await message.answer("Не получилось загрузить список институтов. Попробуй позже.")
         return
 
@@ -575,7 +545,13 @@ async def on_setup_institute(message: Message, state: FSMContext, schedules: Sch
         await message.answer("Выбери институт кнопкой.", reply_markup=_institutes_kb(labels))
         return
 
-    by_course = await schedules.list_groups_by_course(int(selected["subdiv_id"]))
+    try:
+        by_course = await schedules.list_groups_by_course(int(selected["subdiv_id"]))
+    except Exception:
+        logging.exception("Failed to load groups by course")
+        await message.answer("Не получилось загрузить курсы. Попробуй позже.")
+        return
+
     courses = sorted(by_course.keys())
     if not courses:
         await message.answer("Не нашёл курсы для этого института. Выбери другой.")
@@ -587,13 +563,15 @@ async def on_setup_institute(message: Message, state: FSMContext, schedules: Sch
         courses=courses,
         by_course={str(k): [{"group_id": g.group_id, "title": g.title} for g in v] for k, v in by_course.items()},
     )
-    await message.answer("Выбери курс:", reply_markup=_paged_kb([str(c) for c in courses], page=0, page_size=12, row_size=3, show_back=True, show_cancel=True))
+    await message.answer(
+        "Выбери курс:",
+        reply_markup=_paged_kb([str(c) for c in courses], page=0, page_size=12, row_size=3, show_back=True, show_cancel=True),
+    )
 
 
 async def on_setup_course(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    courses = data.get("courses") or []
-    courses = [int(c) for c in courses]
+    courses = [int(c) for c in (data.get("courses") or [])]
     if not courses:
         await message.answer("Список курсов пуст. Нажми «Изменить группу» или /start", reply_markup=MENU_KB)
         await state.clear()
@@ -674,7 +652,7 @@ async def on_setup_group(message: Message, state: FSMContext, store: UserSetting
     if message.from_user is None:
         return
 
-    store.set(
+    await store.set(
         message.from_user.id,
         {
             "group_id": selected.group_id,
@@ -718,7 +696,7 @@ async def on_report_message(message: Message, state: FSMContext, store: UserSett
         report_photo = message.photo[-1].file_id
 
     if incoming_text:
-        if incoming_text in {BTN_TODAY, BTN_TOMORROW, BTN_THIS_WEEK, BTN_NEXT_WEEK, BTN_CHANGE_GROUP, BTN_REPORT}:
+        if incoming_text in ALL_BTNS:
             await message.answer("Подробно опиши проблему текстом. Можно прикрепить фото.")
             return
         report_text = incoming_text
@@ -761,16 +739,15 @@ async def on_report_message(message: Message, state: FSMContext, store: UserSett
         parts.append(safe_body)
     admin_text = "\n".join(parts)
 
-    if ADMIN_USER_ID > 0:
-        try:
-            if report_photo is not None:
-                await bot.send_photo(chat_id=ADMIN_USER_ID, photo=report_photo, caption=admin_text[:1024])
-                if len(admin_text) > 1024:
-                    await bot.send_message(chat_id=ADMIN_USER_ID, text=admin_text)
-            else:
+    try:
+        if report_photo is not None:
+            await bot.send_photo(chat_id=ADMIN_USER_ID, photo=report_photo, caption=admin_text[:1024])
+            if len(admin_text) > 1024:
                 await bot.send_message(chat_id=ADMIN_USER_ID, text=admin_text)
-        except Exception:
-            logging.exception("Failed to send bug report to admin")
+        else:
+            await bot.send_message(chat_id=ADMIN_USER_ID, text=admin_text)
+    except Exception:
+        logging.exception("Failed to send bug report to admin")
 
     await state.clear()
     await message.answer("Спасибо! Скоро всё исправим.", reply_markup=MENU_KB)
@@ -804,6 +781,7 @@ async def _send_day(message: Message, schedules: ScheduleClient, group_id: int, 
     try:
         _, days = await schedules.get_week_schedule(group_id, target_date)
     except Exception:
+        logging.exception("Failed to load day schedule")
         await message.answer("Не получилось загрузить расписание. Попробуй позже.")
         return
 
@@ -818,13 +796,14 @@ async def _send_day(message: Message, schedules: ScheduleClient, group_id: int, 
         await message.answer(f"Не нашёл расписание {title}.")
         return
 
-    await message.answer(_format_day_message(target.heading, target.lessons))
+    await safe_send(message, _format_day_message(target.heading, target.lessons))
 
 
 async def _send_week(message: Message, schedules: ScheduleClient, group_id: int, monday: date, title: str) -> None:
     try:
         _, days = await schedules.get_week_schedule(group_id, monday)
     except Exception:
+        logging.exception("Failed to load week schedule")
         await message.answer("Не получилось загрузить расписание. Попробуй позже.")
         return
 
@@ -849,9 +828,10 @@ async def _send_week(message: Message, schedules: ScheduleClient, group_id: int,
         return
 
     for _, day in picked:
-        await message.answer(_format_day_message(day.heading, day.lessons))
+        await safe_send(message, _format_day_message(day.heading, day.lessons))
 
 
+# === Main ===
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -899,9 +879,6 @@ async def main() -> None:
                 logging.warning("Telegram недоступен (%s). Повтор через %sс", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
-    except Exception:
-        logging.exception("Bot stopped with error")
-        raise
     finally:
         await http_session.close()
         await bot.session.close()
