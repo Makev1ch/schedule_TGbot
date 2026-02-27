@@ -8,7 +8,7 @@ import re
 import random
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, List, Tuple
+from typing import Any, Optional, List, Tuple, Dict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import aiohttp
 from dotenv import load_dotenv
@@ -34,15 +34,15 @@ except ZoneInfoNotFoundError:
     IRKUTSK_TZ = timezone(timedelta(hours=8))
 
 BASE_SCHEDULE_URL = "https://www.istu.edu/schedule/"
-try:
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-except ValueError:
-    ADMIN_USER_ID = 0
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or "1307617601")
 
 # Network Settings
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
 REQUEST_TIMEOUT = 15.0
+
+# FSM cleanup interval
+FSM_CLEANUP_INTERVAL = 3 * 60 * 60  # 3 часа
 
 # ==================== REGEX ====================
 RE_TIME = re.compile(r"^(\d{1,2}):(\d{2})$")
@@ -251,6 +251,72 @@ def build_paged_kb(options: List[str], page: int, page_size: int, row_size: int,
     keyboard.append([KeyboardButton(text=BTN_CANCEL)])
     
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+# ==================== REFERENCE DATA CACHE ====================
+class ReferenceDataCache:
+    """
+    In-memory кэш для справочных данных (институты, группы).
+    Вместо хранения в FSM на каждого юзера - один экземпляр в памяти бота.
+    """
+    
+    def __init__(self, schedule_client: 'ScheduleClient'):
+        self._client = schedule_client
+        
+        # Кэш институтов
+        self._institutes: Optional[List[Institute]] = None
+        self._institutes_loaded_at: Optional[float] = None
+        self._institutes_ttl = 1800.0  # 30 минут
+        
+        # Кэш групп: {subdiv_id: {course: [Group]}}
+        self._groups_cache: Dict[int, Dict[int, List[Group]]] = {}
+        self._groups_loaded_at: Dict[int, float] = {}
+        self._groups_ttl = 600.0  # 10 минут
+        
+        # Индексы для быстрого поиска
+        self._inst_by_label: Dict[str, Institute] = {}
+    
+    def _current_time(self) -> float:
+        return asyncio.get_running_loop().time()
+    
+    async def get_institutes(self) -> List[Institute]:
+        now = self._current_time()
+        
+        if self._institutes is not None and self._institutes_loaded_at:
+            if now - self._institutes_loaded_at < self._institutes_ttl:
+                return self._institutes
+        
+        self._institutes = await self._client.list_institutes()
+        self._institutes_loaded_at = now
+        
+        self._inst_by_label = {}
+        for inst in self._institutes:
+            label = "СШГ" if _is_sshg(inst.title) else inst.title
+            self._inst_by_label[label] = inst
+        
+        return self._institutes
+    
+    def get_institute_labels(self) -> List[str]:
+        return list(self._inst_by_label.keys())
+    
+    def find_institute_by_label(self, label: str) -> Optional[Institute]:
+        return self._inst_by_label.get(label)
+    
+    async def get_groups_by_course(self, subdiv_id: int) -> Dict[int, List[Group]]:
+        now = self._current_time()
+        
+        if subdiv_id in self._groups_cache:
+            loaded_at = self._groups_loaded_at.get(subdiv_id, 0)
+            if now - loaded_at < self._groups_ttl:
+                return self._groups_cache[subdiv_id]
+        
+        by_course = await self._client.list_groups_by_course(subdiv_id)
+        self._groups_cache[subdiv_id] = by_course
+        self._groups_loaded_at[subdiv_id] = now
+        
+        return by_course
+    
+    def get_cached_groups(self, subdiv_id: int) -> Optional[Dict[int, List[Group]]]:
+        return self._groups_cache.get(subdiv_id)
 
 # ==================== NAVIGATION LOGIC ====================
 async def handle_navigation(
@@ -489,62 +555,57 @@ async def safe_request(message: Message, coro):
         await message.answer("⚠️ Не удалось связаться с сервером ИРНИТУ. Попробуй позже.")
         return None
 
-async def cmd_start(message: Message, state: FSMContext, schedules: ScheduleClient):
+async def cmd_start(message: Message, state: FSMContext, ref_cache: ReferenceDataCache):
     await state.clear()
     await state.set_state(SetupFlow.institute)
     
-    institutes = await safe_request(message, schedules.list_institutes())
-    if not institutes:
+    try:
+        await ref_cache.get_institutes()
+    except Exception:
+        logging.exception("Failed to load institutes")
+        await message.answer("⚠️ Не удалось загрузить список институтов. Попробуй позже.")
         return
     
-    data = [
-        {"id": i.subdiv_id, "title": i.title, "label": "СШГ" if _is_sshg(i.title) else i.title}
-        for i in institutes
-    ]
-    await state.update_data(institutes=data)
-    
-    labels = [d["label"] for d in data]
+    labels = ref_cache.get_institute_labels()
     await state.update_data(inst_page=0)
     await message.answer("Выбери институт:", reply_markup=build_paged_kb(labels, 0, 12, 1, False))
 
-async def on_setup_institute(message: Message, state: FSMContext, schedules: ScheduleClient):
-    data = await state.get_data()
-    institutes = data.get("institutes", [])
-    labels = [i["label"] for i in institutes]
+async def on_setup_institute(message: Message, state: FSMContext, ref_cache: ReferenceDataCache):
+    labels = ref_cache.get_institute_labels()
     
     if await handle_navigation(message, state, labels, "inst_page", 12, 1):
         return
     
-    selected = next((i for i in institutes if i["label"] == message.text), None)
+    selected = ref_cache.find_institute_by_label(message.text)
     if not selected:
         await message.answer("Выбери институт кнопкой.", reply_markup=build_paged_kb(labels, 0, 12, 1, False))
         return
     
-    by_course = await safe_request(message, schedules.list_groups_by_course(selected["id"]))
-    if not by_course:
+    try:
+        await ref_cache.get_groups_by_course(selected.subdiv_id)
+    except Exception:
+        logging.exception(f"Failed to load groups for subdiv {selected.subdiv_id}")
+        await message.answer("⚠️ Не удалось загрузить список групп. Попробуй позже.")
         return
     
-    courses = sorted(by_course.keys())
+    by_course = ref_cache.get_cached_groups(selected.subdiv_id)
+    courses = sorted(by_course.keys()) if by_course else []
+    
     if not courses:
         await message.answer("Нет курсов для этого института.")
         return
     
     await state.set_state(SetupFlow.course)
-    await state.update_data(
-        subdiv_id=selected["id"],
-        courses=courses,
-        by_course={k: [{"id": g.group_id, "title": g.title} for g in v] for k, v in by_course.items()},
-        course_page=0
-    )
+    await state.update_data(subdiv_id=selected.subdiv_id, courses=courses, course_page=0)
     await message.answer("Выбери курс:", reply_markup=build_paged_kb([str(c) for c in courses], 0, 12, 3, True))
 
-async def on_setup_course(message: Message, state: FSMContext):
+async def on_setup_course(message: Message, state: FSMContext, ref_cache: ReferenceDataCache):
     data = await state.get_data()
     courses = data.get("courses", [])
+    subdiv_id = data.get("subdiv_id")
     course_labels = [str(c) for c in courses]
     
-    back_labels = [i["label"] for i in data.get("institutes", [])]
-    if await handle_navigation(message, state, course_labels, "course_page", 12, 3, SetupFlow.institute, back_labels):
+    if await handle_navigation(message, state, course_labels, "course_page", 12, 3, SetupFlow.institute, ref_cache.get_institute_labels()):
         return
     
     try:
@@ -557,44 +618,54 @@ async def on_setup_course(message: Message, state: FSMContext):
         await message.answer("Выбери курс кнопкой.", reply_markup=build_paged_kb(course_labels, 0, 12, 3, True))
         return
     
-    groups_raw = data.get("by_course", {}).get(str(course), [])
-    groups = [Group(g["id"], g["title"]) for g in groups_raw]
+    by_course = ref_cache.get_cached_groups(subdiv_id)
+    if not by_course:
+        await message.answer("⚠️ Данные устарели. Начни заново /start")
+        await state.clear()
+        return
     
+    groups = by_course.get(course, [])
     if not groups:
         await message.answer("Нет групп на этом курсе.")
         return
     
     await state.set_state(SetupFlow.group)
-    await state.update_data(
-        course=course,
-        groups=[{"id": g.group_id, "title": g.title} for g in groups],
-        group_page=0
-    )
+    await state.update_data(course=course, group_page=0)
     await message.answer("Выбери группу:", reply_markup=build_paged_kb([g.title for g in groups], 0, 10, 2, True))
 
-async def on_setup_group(message: Message, state: FSMContext, store: UserSettingsStore):
+async def on_setup_group(message: Message, state: FSMContext, ref_cache: ReferenceDataCache, store: UserSettingsStore):
     data = await state.get_data()
-    groups_raw = data.get("groups", [])
-    titles = [g["title"] for g in groups_raw]
+    subdiv_id = data.get("subdiv_id")
+    course = data.get("course")
+    
+    by_course = ref_cache.get_cached_groups(subdiv_id)
+    if not by_course:
+        await message.answer("⚠️ Данные устарели. Начни заново /start")
+        await state.clear()
+        return
+    
+    groups = by_course.get(course, [])
+    titles = [g.title for g in groups]
     
     back_courses = [str(c) for c in data.get("courses", [])]
     if await handle_navigation(message, state, titles, "group_page", 10, 2, SetupFlow.course, back_courses):
         return
     
-    selected = next((g for g in groups_raw if g["title"] == message.text), None)
+    selected = next((g for g in groups if g.title == message.text), None)
     if not selected:
         page = data.get("group_page", 0)
         await message.answer("Выбери группу кнопкой.", reply_markup=build_paged_kb(titles, page, 10, 2, True))
         return
     
     await store.set(message.from_user.id, {
-        "group_id": selected["id"],
-        "group_title": selected["title"],
-        "subdiv_id": data.get("subdiv_id"),
-        "course": data.get("course"),
+        "group_id": selected.group_id,
+        "group_title": selected.title,
+        "subdiv_id": subdiv_id,
+        "course": course,
     })
+    
     await state.clear()
-    await message.answer(f"Ок, группа: {selected['title']}", reply_markup=MENU_KB)
+    await message.answer(f"Ок, группа: {selected.title}", reply_markup=MENU_KB)
 
 async def cmd_report(message: Message, state: FSMContext):
     await state.clear()
@@ -643,19 +714,16 @@ async def on_report_message(message: Message, state: FSMContext, store: UserSett
             f"{body}"
         )
         
-        sent = False
-        if ADMIN_USER_ID > 0:
-            try:
-                if photo:
-                    await bot.send_photo(ADMIN_USER_ID, photo, caption=msg[:1024])
-                else:
-                    await bot.send_message(ADMIN_USER_ID, msg)
-                sent = True
-            except Exception:
-                logging.exception("Send report error")
+        try:
+            if photo:
+                await bot.send_photo(ADMIN_USER_ID, photo, caption=msg[:1024])
+            else:
+                await bot.send_message(ADMIN_USER_ID, msg)
+        except Exception:
+            logging.exception("Send report error")
         
         await state.clear()
-        await message.answer("Спасибо! Передал." if sent else "Спасибо! Принял.", reply_markup=MENU_KB)
+        await message.answer("Спасибо! Передал.", reply_markup=MENU_KB)
     else:
         await message.answer("Фото принято. Теперь опиши проблему текстом.")
 
@@ -713,6 +781,16 @@ async def send_week(message: Message, schedules: ScheduleClient, gid: int, monda
     for _, d in picked:
         await safe_send(message, _format_day_message(d.heading, d.lessons))
 
+# ==================== FSM CLEANUP TASK ====================
+async def fsm_cleanup_task(fsm_storage: MySQLStorage):
+    """Периодическая очистка FSM записей раз в 3 часа."""
+    while True:
+        await asyncio.sleep(FSM_CLEANUP_INTERVAL)
+        try:
+            await fsm_storage.cleanup()
+        except Exception:
+            logging.exception("FSM cleanup error")
+
 # ==================== MAIN ====================
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -727,7 +805,6 @@ async def main():
         session=AiohttpSession(proxy=os.getenv("TELEGRAM_PROXY"))
     )
     
-    # Database
     db = Database(
         os.getenv("DB_HOST", "localhost"),
         int(os.getenv("DB_PORT", "3306")),
@@ -745,9 +822,11 @@ async def main():
     
     dp = Dispatcher(storage=fsm_storage)
     
-    async with aiohttp.ClientSession(headers={"User-Agent": "ISTU-Bot/2.1"}) as http:
+    async with aiohttp.ClientSession(headers={"User-Agent": "ISTU-Bot/2.2"}) as http:
         schedules = ScheduleClient(http)
-        dp["store"], dp["schedules"] = store, schedules
+        ref_cache = ReferenceDataCache(schedules)
+        
+        dp["store"], dp["schedules"], dp["ref_cache"] = store, schedules, ref_cache
         
         dp.message.register(cmd_start, Command("start"))
         dp.message.register(cmd_start, F.text == BTN_CHANGE_GROUP)
@@ -758,12 +837,19 @@ async def main():
         dp.message.register(on_report_message, ReportFlow.report)
         dp.message.register(on_menu, F.text.in_({BTN_TODAY, BTN_TOMORROW, BTN_THIS_WEEK, BTN_NEXT_WEEK}))
         
+        cleanup_task = asyncio.create_task(fsm_cleanup_task(fsm_storage))
+        
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             me = await bot.get_me()
             logging.info(f"Bot @{me.username} started")
             await dp.start_polling(bot)
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
             await db.disconnect()
             await bot.session.close()
 
