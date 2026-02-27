@@ -3,6 +3,7 @@ import logging
 import json
 from typing import Optional, Any, Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
 import aiomysql
 from aiogram.fsm.state import State
@@ -127,6 +128,14 @@ class UserSettingsStore:
 
 
 class MySQLStorage(BaseStorage):
+    """
+    FSM Storage с очисткой старых записей.
+    - При старте бота (initialize)
+    - Раз в 3 часа (фоновый таск в main.py)
+    """
+    
+    FSM_TTL_DAYS = 7  # Удалять записи старше N дней
+    
     def __init__(self, db: Database):
         self._db = db
 
@@ -141,6 +150,7 @@ class MySQLStorage(BaseStorage):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         logger.info("FSM table initialized")
+        await self.cleanup()
 
     def _build_key(self, key: StorageKey) -> str:
         parts = ["fsm", str(key.bot_id)]
@@ -206,3 +216,26 @@ class MySQLStorage(BaseStorage):
 
     async def close(self) -> None:
         return None
+    
+    async def cleanup(self) -> None:
+        """
+        Удаляет старые FSM записи:
+        1. Все записи старше FSM_TTL_DAYS дней
+        2. Незавершённые flow (state IS NOT NULL) старше 1 дня
+        """
+        cutoff_old = datetime.now() - timedelta(days=self.FSM_TTL_DAYS)
+        cutoff_incomplete = datetime.now() - timedelta(days=1)
+        
+        # Удаляем старые записи
+        await self._db.execute(
+            "DELETE FROM fsm_context WHERE updated_at < %s",
+            (cutoff_old,)
+        )
+        
+        # Удаляем незавершённые flow
+        await self._db.execute(
+            "DELETE FROM fsm_context WHERE state IS NOT NULL AND updated_at < %s",
+            (cutoff_incomplete,)
+        )
+        
+        logger.info("FSM cleanup completed")
