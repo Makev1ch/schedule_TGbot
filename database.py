@@ -1,16 +1,13 @@
-# database.py — MySQL Database Layer
 import logging
 import json
 from typing import Optional, Any, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-
 import aiomysql
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 
 logger = logging.getLogger(__name__)
-
 
 class Database:
     def __init__(self, host: str, port: int, user: str, password: str, database: str):
@@ -20,30 +17,24 @@ class Database:
         self._password = password
         self._database = database
         self._pool: Optional[aiomysql.Pool] = None
-    
+
     async def connect(self):
         if self._pool:
             return
         self._pool = await aiomysql.create_pool(
-            host=self._host,
-            port=self._port,
-            user=self._user,
-            password=self._password,
-            db=self._database,
-            autocommit=True,
-            minsize=2,
-            maxsize=10,
-            charset='utf8mb4'
+            host=self._host, port=self._port, user=self._user,
+            password=self._password, db=self._database, autocommit=True,
+            minsize=2, maxsize=10, charset='utf8mb4'
         )
         logger.info(f"DB connected: {self._host}:{self._port}/{self._database}")
-    
+
     async def disconnect(self):
         if self._pool:
             self._pool.close()
             await self._pool.wait_closed()
             self._pool = None
             logger.info("DB disconnected")
-    
+
     @asynccontextmanager
     async def cursor(self):
         if not self._pool:
@@ -55,26 +46,25 @@ class Database:
         finally:
             await cur.close()
             self._pool.release(conn)
-    
+
     async def execute(self, query: str, params: tuple = None):
         async with self.cursor() as cur:
             await cur.execute(query, params)
-    
+
     async def fetchone(self, query: str, params: tuple = None):
         async with self.cursor() as cur:
             await cur.execute(query, params)
             return await cur.fetchone()
-    
+
     async def fetchall(self, query: str, params: tuple = None):
         async with self.cursor() as cur:
             await cur.execute(query, params)
             return await cur.fetchall()
 
-
 class UserSettingsStore:
     def __init__(self, db: Database):
         self._db = db
-    
+
     async def initialize(self):
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
@@ -89,7 +79,7 @@ class UserSettingsStore:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         logger.info("user_settings table initialized")
-    
+
     async def set(self, user_id: int, settings: dict):
         await self._db.execute("""
             INSERT INTO user_settings (user_id, group_id, group_title, subdiv_id, course)
@@ -100,42 +90,21 @@ class UserSettingsStore:
                 subdiv_id = VALUES(subdiv_id),
                 course = VALUES(course),
                 updated_at = CURRENT_TIMESTAMP
-        """, (
-            user_id,
-            settings.get("group_id"),
-            settings.get("group_title"),
-            settings.get("subdiv_id"),
-            settings.get("course")
-        ))
-    
+        """, (user_id, settings.get("group_id"), settings.get("group_title"), settings.get("subdiv_id"), settings.get("course")))
+
     async def get(self, user_id: int) -> dict:
-        row = await self._db.fetchone(
-            "SELECT group_id, group_title, subdiv_id, course FROM user_settings WHERE user_id = %s",
-            (user_id,)
-        )
+        row = await self._db.fetchone("SELECT group_id, group_title, subdiv_id, course FROM user_settings WHERE user_id = %s", (user_id,))
         if row:
-            return {
-                "group_id": row[0],
-                "group_title": row[1],
-                "subdiv_id": row[2],
-                "course": row[3]
-            }
+            return {"group_id": row[0], "group_title": row[1], "subdiv_id": row[2], "course": row[3]}
         return {}
-    
+
     async def count(self) -> int:
         row = await self._db.fetchone("SELECT COUNT(*) FROM user_settings")
         return row[0] if row else 0
 
-
 class MySQLStorage(BaseStorage):
-    """
-    FSM Storage с очисткой старых записей.
-    - При старте бота (initialize)
-    - Раз в 3 часа (фоновый таск в main.py)
-    """
-    
-    FSM_TTL_DAYS = 7  # Удалять записи старше N дней
-    
+    FSM_TTL_DAYS = 7
+
     def __init__(self, db: Database):
         self._db = db
 
@@ -177,14 +146,13 @@ class MySQLStorage(BaseStorage):
     async def set_state(self, key: StorageKey, state: Any = None) -> None:
         fsm_key = self._build_key(key)
         state_str = self._state_to_str(state)
-        await self._db.execute(
-            """
+        await self._db.execute("""
             INSERT INTO fsm_context (fsm_key, state, data_json)
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE state = VALUES(state)
-            """,
-            (fsm_key, state_str, "{}"),
-        )
+            ON DUPLICATE KEY UPDATE
+                state = VALUES(state),
+                updated_at = CURRENT_TIMESTAMP
+        """, (fsm_key, state_str, "{}"))
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         fsm_key = self._build_key(key)
@@ -194,14 +162,15 @@ class MySQLStorage(BaseStorage):
     async def set_data(self, key: StorageKey, data: Mapping[str, Any]) -> None:
         fsm_key = self._build_key(key)
         payload = json.dumps(dict(data), ensure_ascii=False)
-        await self._db.execute(
-            """
+        # Оптимизация: убран лишний SELECT. COALESCE сохраняет state, если он уже был в БД.
+        await self._db.execute("""
             INSERT INTO fsm_context (fsm_key, state, data_json)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE data_json = VALUES(data_json)
-            """,
-            (fsm_key, None, payload),
-        )
+            VALUES (%s, NULL, %s)
+            ON DUPLICATE KEY UPDATE
+                data_json = VALUES(data_json),
+                state = COALESCE(VALUES(state), state),
+                updated_at = CURRENT_TIMESTAMP
+        """, (fsm_key, payload))
 
     async def get_data(self, key: StorageKey) -> dict[str, Any]:
         fsm_key = self._build_key(key)
@@ -216,26 +185,10 @@ class MySQLStorage(BaseStorage):
 
     async def close(self) -> None:
         return None
-    
+
     async def cleanup(self) -> None:
-        """
-        Удаляет старые FSM записи:
-        1. Все записи старше FSM_TTL_DAYS дней
-        2. Незавершённые flow (state IS NOT NULL) старше 1 дня
-        """
         cutoff_old = datetime.now() - timedelta(days=self.FSM_TTL_DAYS)
         cutoff_incomplete = datetime.now() - timedelta(days=1)
-        
-        # Удаляем старые записи
-        await self._db.execute(
-            "DELETE FROM fsm_context WHERE updated_at < %s",
-            (cutoff_old,)
-        )
-        
-        # Удаляем незавершённые flow
-        await self._db.execute(
-            "DELETE FROM fsm_context WHERE state IS NOT NULL AND updated_at < %s",
-            (cutoff_incomplete,)
-        )
-        
+        await self._db.execute("DELETE FROM fsm_context WHERE updated_at < %s", (cutoff_old,))
+        await self._db.execute("DELETE FROM fsm_context WHERE state IS NOT NULL AND updated_at < %s", (cutoff_incomplete,))
         logger.info("FSM cleanup completed")
