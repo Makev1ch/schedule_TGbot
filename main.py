@@ -13,6 +13,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Tuple, Dict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 import aiohttp
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -25,6 +26,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, BotCommand, BotCommandScopeChat, KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
+
 from database_stable import Database, UserSettingsStore, MySQLStorage
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
@@ -39,6 +41,7 @@ BASE_SCHEDULE_URL = "https://www.istu.edu/raspisanie/"
 SEARCH_URL = "https://www.istu.edu/raspisanie/poisk"
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or "1307617601")
 USER_IDS_FILE = Path(__file__).with_name("telegram_ids.txt")
+
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
 REQUEST_TIMEOUT = 15.0
@@ -88,6 +91,7 @@ MENU_KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
 MENU_KB_GROUP = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
@@ -97,6 +101,7 @@ MENU_KB_GROUP = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
 MENU_KB_TEACHER = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
@@ -214,7 +219,6 @@ def _format_day_message(heading: str, lessons: List[Lesson]) -> str:
     lessons.sort(key=lambda l: (l.start, _subgroup_sort_key(l.subgroup), l.subject.lower(), l.kind, l.room, l.teacher))
     blocks: dict[time, List[Lesson]] = {}
     order: List[time] = []
-
     for lesson in lessons:
         if lesson.start not in blocks:
             blocks[lesson.start] = []
@@ -252,7 +256,6 @@ def _format_day_message_teacher(heading: str, lessons: List[Lesson]) -> str:
     lessons.sort(key=lambda l: (l.start, _subgroup_sort_key(l.subgroup), l.subject.lower(), l.kind, l.room))
     blocks: dict[time, List[Lesson]] = {}
     order: List[time] = []
-
     for lesson in lessons:
         if lesson.start not in blocks:
             blocks[lesson.start] = []
@@ -294,7 +297,6 @@ def build_paged_kb(options: List[str], page: int, page_size: int, row_size: int,
     keyboard: List[List[KeyboardButton]] = []
     for row in _chunk(slice_opts, row_size):
         keyboard.append([KeyboardButton(text=t) for t in row])
-    
     controls = []
     if page > 0:
         controls.append(KeyboardButton(text=BTN_PAGE_PREV))
@@ -302,7 +304,6 @@ def build_paged_kb(options: List[str], page: int, page_size: int, row_size: int,
         controls.append(KeyboardButton(text=BTN_PAGE_NEXT))
     if controls:
         keyboard.append(controls)
-    
     keyboard.append([KeyboardButton(text=BTN_REPORT)])
     if show_back:
         keyboard.append([KeyboardButton(text=BTN_BACK)])
@@ -336,7 +337,6 @@ class ReferenceDataCache:
         if self._institutes is not None and self._institutes_loaded_at:
             if now - self._institutes_loaded_at < self._institutes_ttl:
                 return self._institutes
-        
         self._institutes = await self._client.list_institutes()
         self._institutes_loaded_at = now
         self._inst_by_label = {}
@@ -356,7 +356,6 @@ class ReferenceDataCache:
         if subdiv_id in self._groups_cache:
             if now - self._groups_loaded_at.get(subdiv_id, 0) < self._groups_ttl:
                 return self._groups_cache[subdiv_id]
-        
         by_course = await self._client.list_groups_by_course(subdiv_id)
         self._groups_cache[subdiv_id] = by_course
         self._groups_loaded_at[subdiv_id] = now
@@ -367,8 +366,8 @@ class ReferenceDataCache:
 
 # ==================== NAVIGATION LOGIC ====================
 async def handle_navigation(
-    message: Message, state: FSMContext, options: List[str], page_key: str, 
-    page_size: int, row_size: int, back_state: Optional[State] = None, 
+    message: Message, state: FSMContext, options: List[str], page_key: str,
+    page_size: int, row_size: int, back_state: Optional[State] = None,
     back_options: Optional[List[str]] = None
 ) -> bool:
     text = message.text
@@ -378,13 +377,11 @@ async def handle_navigation(
         kb = MENU_KB_TEACHER if fsm_data.get("mode") == "teacher" else MENU_KB_GROUP
         await message.answer("Ок", reply_markup=kb)
         return True
-
     if text == BTN_BACK and back_state:
         await state.set_state(back_state)
         if back_options:
             await message.answer("Выбери:", reply_markup=build_paged_kb(back_options, 0, page_size, 1, False))
         return True
-
     if text in (BTN_PAGE_PREV, BTN_PAGE_NEXT):
         data = await state.get_data()
         current_page = data.get(page_key, 0)
@@ -393,7 +390,6 @@ async def handle_navigation(
         else:
             max_page = (len(options) - 1) // page_size
             new_page = min(max_page, current_page + 1)
-        
         await state.update_data({page_key: new_page})
         await message.answer("Выбери:", reply_markup=build_paged_kb(options, new_page, page_size, row_size, bool(back_state)))
         return True
@@ -411,6 +407,9 @@ async def safe_send(message: Message, text: str, limit: int = 3500):
         parts.append(text)
     for part in parts:
         await message.answer(part)
+
+class NoScheduleFound(Exception):
+    pass
 
 # ==================== SCHEDULE CLIENT ====================
 class ScheduleClient:
@@ -500,8 +499,7 @@ class ScheduleClient:
         key = f"{group_id}:{target_date.isoformat()}"
         if cached := self._cache.get(key):
             # Глубокое копирование для предотвращения мутации кэша
-            return copy.deepcopy(cached[1]) 
-        
+            return copy.deepcopy(cached[1])
         url = f"{BASE_SCHEDULE_URL}grup/{group_id}/{target_date.strftime('%d.%m.%Y')}/"
         html_content = await self._fetch(url)
         result = self._parse_schedule_html(html_content, target_date)
@@ -513,7 +511,6 @@ class ScheduleClient:
         key = f"prep:{prep_id}:{target_date.isoformat()}"
         if cached := self._cache.get(key):
             return copy.deepcopy(cached[1])
-        
         url = f"{BASE_SCHEDULE_URL}prepodavatel/{prep_id}/{target_date.strftime('%d.%m.%Y')}/"
         html_content = await self._fetch(url)
         result = self._parse_schedule_html(html_content, target_date)
@@ -524,7 +521,6 @@ class ScheduleClient:
         soup = BeautifulSoup(html_content, "html.parser")
         days: List[DaySchedule] = []
         target_is_odd = is_odd_week(target_date)
-        
         for day_div in soup.select("div.sch-list-day"):
             params_str = day_div.get("data-params", "{}")
             try:
@@ -532,10 +528,8 @@ class ScheduleClient:
                 date_str = params.get("date", "")
             except Exception:
                 date_str = ""
-                
             heading_el = day_div.select_one("h2")
             heading = heading_el.get_text(" ", strip=True) if heading_el else "Неизвестный день"
-            
             lessons: List[Lesson] = []
             for item_div in day_div.select("div.sch-list-item"):
                 item_params_str = item_div.get("data-params", "{}")
@@ -544,11 +538,9 @@ class ScheduleClient:
                     time_str = item_params.get("time", "")
                 except Exception:
                     time_str = ""
-                    
                 start = _parse_time(time_str) if time_str else None
                 if not start:
                     continue
-                    
                 week_blocks = []
                 for wb in item_div.select("div.sch-list-item-week"):
                     classes = wb.get("class", [])
@@ -561,21 +553,17 @@ class ScheduleClient:
                     if not target_is_odd and "week-even" in classes:
                         week_blocks.append(wb)
                         continue
-                        
                 for week_block in week_blocks:
                     for schcls in week_block.select("div.schcls-item"):
                         if "schcls-empty" in schcls.get("class", []):
                             continue
-                            
                         subject_el = schcls.select_one("div.schcls-item-name")
                         subject = subject_el.get_text(" ", strip=True) if subject_el else ""
                         if not subject:
                             continue
-                            
                         distype_el = schcls.select_one("div.schcls-item-distype")
                         kind_raw = distype_el.get_text(" ", strip=True).lower() if distype_el else ""
                         kind = _extract_lesson_kind(kind_raw)
-                        
                         teacher = "—"
                         prepod_el = schcls.select_one("div.schcls-item-prepod")
                         if prepod_el:
@@ -584,7 +572,6 @@ class ScheduleClient:
                                 teacher = prepod_link.get_text(" ", strip=True)
                         if not teacher:
                             teacher = "—"
-                            
                         group_name = ""
                         subgroup = ""
                         group_el = schcls.select_one("div.schcls-item-group")
@@ -596,23 +583,18 @@ class ScheduleClient:
                             subgroup_match = re.search(r"подгруппа\s*(\d+)", full_group_text, re.IGNORECASE)
                             if subgroup_match:
                                 subgroup = f"подгруппа {subgroup_match.group(1)}"
-                                
                         room = "—"
                         aud_el = schcls.select_one("div.schcls-item-aud")
                         if aud_el:
                             room_text = aud_el.get_text(" ", strip=True)
                             if room_text and room_text != "-":
                                 room = room_text
-                                
                         lessons.append(Lesson(start, subject, kind, subgroup, room, teacher, group_name))
-            
             lessons.sort(key=lambda l: (l.start, l.subject.lower(), l.subgroup, l.room))
             days.append(DaySchedule(heading, lessons, date_str))
-            
         if not days:
-            logging.error("_parse_schedule_html: 0 дней найдено")
-            raise RuntimeError("Invalid HTML structure: no days found")
-            
+            logging.info("Расписание отсутствует")
+            raise NoScheduleFound("No schedule found")
         return (target_is_odd, days)
 
     async def search_teachers(self, query: str) -> List[Teacher]:
@@ -670,7 +652,9 @@ async def import_users_from_file(db: Database, filepath: Path):
 async def safe_request(message: Message, coro):
     try:
         return await coro
-    except Exception as e:
+    except NoScheduleFound:
+        return "NO_SCHEDULE"
+    except Exception:
         logging.exception("Schedule request failed")
         await message.answer("⚠️ Не удалось связаться с сервером ИРНИТУ. Попробуй позже.")
         return None
@@ -686,7 +670,6 @@ async def cmd_start(message: Message, state: FSMContext, ref_cache: ReferenceDat
         logging.exception("Failed to load institutes")
         await message.answer("⚠️ Не удалось загрузить список институтов. Попробуй позже.")
         return
-    
     labels = ref_cache.get_institute_labels()
     await state.update_data(inst_page=0)
     await message.answer("Выбери институт:", reply_markup=build_paged_kb(labels, 0, 12, 1, False))
@@ -695,25 +678,21 @@ async def on_setup_institute(message: Message, state: FSMContext, ref_cache: Ref
     labels = ref_cache.get_institute_labels()
     if await handle_navigation(message, state, labels, "inst_page", 12, 1):
         return
-        
     selected = ref_cache.find_institute_by_label(message.text)
     if not selected:
         await message.answer("Выбери институт кнопкой.", reply_markup=build_paged_kb(labels, 0, 12, 1, False))
         return
-        
     try:
         await ref_cache.get_groups_by_course(selected.subdiv_id)
     except Exception:
         logging.exception(f"Failed to load groups for subdiv {selected.subdiv_id}")
         await message.answer("⚠️ Не удалось загрузить список групп. Попробуй позже.")
         return
-        
     by_course = ref_cache.get_cached_groups(selected.subdiv_id)
     courses = sorted(by_course.keys()) if by_course else []
     if not courses:
         await message.answer("Нет курсов для этого института.")
         return
-        
     await state.set_state(SetupFlow.course)
     await state.update_data(subdiv_id=selected.subdiv_id, courses=courses, course_page=0)
     await message.answer("Выбери курс:", reply_markup=build_paged_kb([str(c) for c in courses], 0, 12, 3, True))
@@ -723,31 +702,25 @@ async def on_setup_course(message: Message, state: FSMContext, ref_cache: Refere
     courses = data.get("courses", [])
     subdiv_id = data.get("subdiv_id")
     course_labels = [str(c) for c in courses]
-    
     if await handle_navigation(message, state, course_labels, "course_page", 12, 3, SetupFlow.institute, ref_cache.get_institute_labels()):
         return
-        
     try:
         course = int(message.text)
     except ValueError:
         await message.answer("Выбери курс кнопкой.", reply_markup=build_paged_kb(course_labels, 0, 12, 3, True))
         return
-        
     if course not in courses:
         await message.answer("Выбери курс кнопкой.", reply_markup=build_paged_kb(course_labels, 0, 12, 3, True))
         return
-        
     by_course = ref_cache.get_cached_groups(subdiv_id)
     if not by_course:
         await message.answer("⚠️ Данные устарели. Начни заново /start")
         await state.clear()
         return
-        
     groups = by_course.get(course, [])
     if not groups:
         await message.answer("Нет групп на этом курсе.")
         return
-        
     await state.set_state(SetupFlow.group)
     await state.update_data(course=course, group_page=0)
     await message.answer("Выбери группу:", reply_markup=build_paged_kb([g.title for g in groups], 0, 10, 2, True))
@@ -757,25 +730,20 @@ async def on_setup_group(message: Message, state: FSMContext, ref_cache: Referen
     subdiv_id = data.get("subdiv_id")
     course = data.get("course")
     by_course = ref_cache.get_cached_groups(subdiv_id)
-    
     if not by_course:
         await message.answer("⚠️ Данные устарели. Начни заново /start")
         await state.clear()
         return
-        
     groups = by_course.get(course, [])
     titles = [g.title for g in groups]
     back_courses = [str(c) for c in data.get("courses", [])]
-    
     if await handle_navigation(message, state, titles, "group_page", 10, 2, SetupFlow.course, back_courses):
         return
-        
     selected = next((g for g in groups if g.title == message.text), None)
     if not selected:
         page = data.get("group_page", 0)
         await message.answer("Выбери группу кнопкой.", reply_markup=build_paged_kb(titles, page, 10, 2, True))
         return
-        
     await store.set(message.from_user.id, {
         "group_id": selected.group_id,
         "group_title": selected.title,
@@ -798,23 +766,18 @@ async def on_report_message(message: Message, state: FSMContext, store: UserSett
         await state.clear()
         await message.answer("Ок", reply_markup=MENU_KB_GROUP)
         return
-        
     data = await state.get_data()
     text = data.get("report_text", "")
     photo = data.get("report_photo")
     new_text = message.caption or message.text or ""
-    
     if new_text and new_text not in ALL_BTNS:
         text = f"{text}\n{new_text}".strip()
     if message.photo:
         photo = message.photo[-1].file_id
-        
     if not text and not photo:
         await message.answer("Нужен текст или фото.")
         return
-        
     await state.update_data(report_text=text, report_photo=photo)
-    
     if text:
         user = message.from_user
         u_line = f"{user.full_name} (@{user.username})" if user else "Unknown"
@@ -837,7 +800,6 @@ async def on_menu(message: Message, state: FSMContext, schedules: ScheduleClient
     fsm_data = await state.get_data()
     mode = fsm_data.get("mode", "group")
     now = datetime.now(IRKUTSK_TZ)
-    
     if mode == "teacher":
         teacher_id = fsm_data.get("teacher_prep_id")
         if not teacher_id:
@@ -870,6 +832,9 @@ async def on_menu(message: Message, state: FSMContext, schedules: ScheduleClient
 
 async def send_day(message: Message, schedules: ScheduleClient, gid: int, d: date):
     res = await safe_request(message, schedules.get_week_schedule(gid, d))
+    if res == "NO_SCHEDULE":
+        await message.answer("Нет расписания на этот день.")
+        return
     if not res: return
     _, days = res
     target_day = None
@@ -885,30 +850,33 @@ async def send_day(message: Message, schedules: ScheduleClient, gid: int, d: dat
 
 async def send_week(message: Message, schedules: ScheduleClient, gid: int, monday: date):
     res = await safe_request(message, schedules.get_week_schedule(gid, monday))
+    if res == "NO_SCHEDULE":
+        await message.answer("Нет расписания на неделю.")
+        return
     if not res: return
     _, days = res
     week_end = monday + timedelta(days=6)
     picked = []
     seen_dates = set() # Жесткая защита от дубликатов
-    
     for day in days:
         parsed_date = _parse_date_from_string(day.date_str)
         if parsed_date and monday <= parsed_date <= week_end:
             if day.date_str not in seen_dates:
                 seen_dates.add(day.date_str)
                 picked.append((parsed_date, day))
-                
     picked.sort(key=lambda x: x[0])
     if not picked:
         await message.answer("Нет расписания на неделю.")
         return
-        
     await message.answer("Расписание на неделю:")
     for _, day in picked:
         await safe_send(message, _format_day_message(day.heading, day.lessons))
 
 async def send_teacher_day(message: Message, schedules: ScheduleClient, prep_id: int, d: date):
     res = await safe_request(message, schedules.get_teacher_week_schedule(prep_id, d))
+    if res == "NO_SCHEDULE":
+        await message.answer("Нет расписания на этот день.")
+        return
     if not res: return
     _, days = res
     target_day = None
@@ -924,24 +892,24 @@ async def send_teacher_day(message: Message, schedules: ScheduleClient, prep_id:
 
 async def send_teacher_week(message: Message, schedules: ScheduleClient, prep_id: int, monday: date):
     res = await safe_request(message, schedules.get_teacher_week_schedule(prep_id, monday))
+    if res == "NO_SCHEDULE":
+        await message.answer("Нет расписания на неделю.")
+        return
     if not res: return
     _, days = res
     week_end = monday + timedelta(days=6)
     picked = []
     seen_dates = set() # Жесткая защита от дубликатов
-    
     for day in days:
         parsed_date = _parse_date_from_string(day.date_str)
         if parsed_date and monday <= parsed_date <= week_end:
             if day.date_str not in seen_dates:
                 seen_dates.add(day.date_str)
                 picked.append((parsed_date, day))
-                
     picked.sort(key=lambda x: x[0])
     if not picked:
         await message.answer("Нет расписания на неделю.")
         return
-        
     await message.answer("Расписание на неделю:")
     for _, day in picked:
         await safe_send(message, _format_day_message_teacher(day.heading, day.lessons))
@@ -986,12 +954,10 @@ async def on_teacher_search(message: Message, state: FSMContext, schedules: Sche
             await state.set_state(None)
             await message.answer("Ок", reply_markup=MENU_KB_GROUP)
         return
-        
     query = (message.text or "").strip()
     if not query:
         await message.answer("Введи фамилию.")
         return
-        
     await message.answer("Ищу...")
     try:
         teachers = await schedules.search_teachers(query)
@@ -999,13 +965,11 @@ async def on_teacher_search(message: Message, state: FSMContext, schedules: Sche
         logging.exception("Teacher search failed")
         await message.answer("⚠️ Не удалось выполнить поиск. Попробуй позже.")
         return
-        
     if not teachers:
         await message.answer("Преподаватель не найден. Попробуй уточнить запрос.", reply_markup=ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True
         ))
         return
-        
     if len(teachers) == 1:
         t = teachers[0]
         main_subject = await _get_teacher_main_subject(schedules, t.prep_id)
@@ -1015,7 +979,6 @@ async def on_teacher_search(message: Message, state: FSMContext, schedules: Sche
         subject_line = f"\nВедёт: {html.escape(main_subject)}" if main_subject else ""
         await message.answer(f"Преподаватель: {html.escape(t.name)}{subject_line}", reply_markup=MENU_KB_TEACHER)
         return
-        
     fsm_data = await state.get_data()
     await state.set_data({**fsm_data, "_teacher_search_map": {t.name: t.prep_id for t in teachers}})
     await state.set_state(TeacherFlow.select)
@@ -1033,7 +996,6 @@ async def on_teacher_select(message: Message, state: FSMContext, schedules: Sche
             await state.set_state(None)
             await message.answer("Ок", reply_markup=MENU_KB_GROUP)
         return
-        
     fsm_data = await state.get_data()
     teacher_map = fsm_data.get("_teacher_search_map", {})
     chosen_name = message.text
@@ -1041,7 +1003,6 @@ async def on_teacher_select(message: Message, state: FSMContext, schedules: Sche
     if not prep_id:
         await message.answer("Выбери преподавателя из списка.")
         return
-        
     main_subject = await _get_teacher_main_subject(schedules, prep_id)
     await state.set_data({**{k: v for k, v in fsm_data.items() if k != "_teacher_search_map"}, "mode": "teacher", "teacher_prep_id": prep_id, "teacher_name": chosen_name})
     await state.set_state(None)
@@ -1086,15 +1047,16 @@ async def on_broadcast_text(message: Message, state: FSMContext, bot: Bot, db: D
         await state.clear()
         await message.answer("Рассылка отменена.", reply_markup=MENU_KB_GROUP)
         return
-        
     text = message.text or ""
     if not text.strip():
         await message.answer("Текст пустой. Введи снова или нажми Отмена.")
         return
-        
     await state.clear()
     await message.answer("Начинаю рассылку...")
-    rows = await db.fetchall("SELECT user_id FROM registered_users")
+    rows = await db.fetchall(
+        "SELECT user_id FROM registered_users WHERE user_id != %s",
+        (ADMIN_USER_ID,)
+    )
     user_ids = [row[0] for row in rows] if rows else []
     sent = 0
     failed = 0
@@ -1106,7 +1068,6 @@ async def on_broadcast_text(message: Message, state: FSMContext, bot: Bot, db: D
             failed += 1
             logging.warning(f"Broadcast failed for {uid}: {e}")
         await asyncio.sleep(0.05)
-        
     await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}\nВсего пользователей: {len(user_ids)}", reply_markup=MENU_KB_GROUP)
 
 async def cmd_stats(message: Message, bot: Bot, db: Database, store: UserSettingsStore):
@@ -1115,7 +1076,6 @@ async def cmd_stats(message: Message, bot: Bot, db: Database, store: UserSetting
     total_row = await db.fetchone("SELECT COUNT(*) FROM registered_users")
     total = total_row[0] if total_row else 0
     await message.answer(f"<b>📊 Статистика бота</b>\nВсего пользователей: <b>{total}</b>")
-    
     all_rows = await db.fetchall("SELECT ru.user_id, us.group_title, us.course FROM registered_users ru LEFT JOIN user_settings us ON ru.user_id = us.user_id ORDER BY ru.user_id")
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1125,7 +1085,6 @@ async def cmd_stats(message: Message, bot: Bot, db: Database, store: UserSetting
         group_name = row[1] if row[1] is not None else ""
         course = row[2] if row[2] is not None else ""
         writer.writerow([user_id, group_name, course])
-        
     csv_bytes = output.getvalue().encode("utf-8-sig")
     filename = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     await bot.send_document(ADMIN_USER_ID, BufferedInputFile(csv_bytes, filename=filename))
@@ -1145,29 +1104,28 @@ async def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN required")
-        
+
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML), session=AiohttpSession(proxy=os.getenv("TELEGRAM_PROXY")))
     db = Database(os.getenv("DB_HOST", "localhost"), int(os.getenv("DB_PORT", "3306")), os.getenv("DB_USER", "istu_bot"), os.getenv("DB_PASSWORD", ""), os.getenv("DB_NAME", "istu_bot"))
-    
     await db.connect()
     store = UserSettingsStore(db)
     await store.initialize()
     await init_registered_users_table(db)
     await import_users_from_file(db, USER_IDS_FILE)
-    
     fsm_storage = MySQLStorage(db)
     await fsm_storage.initialize()
+
     dp = Dispatcher(storage=fsm_storage)
-    
+
     async with aiohttp.ClientSession(headers={"User-Agent": "ISTU-Bot/2.3"}) as http:
         schedules = ScheduleClient(http)
         ref_cache = ReferenceDataCache(schedules)
-        
+
         dp["store"] = store
         dp["schedules"] = schedules
         dp["ref_cache"] = ref_cache
         dp["db"] = db
-        
+
         dp.message.register(cmd_start, Command("start"))
         dp.message.register(cmd_start, F.text == BTN_CHANGE_GROUP)
         dp.message.register(cmd_report, F.text == BTN_REPORT)
@@ -1184,9 +1142,9 @@ async def main():
         dp.message.register(cmd_broadcast, Command("broadcast"))
         dp.message.register(cmd_stats, Command("stats"))
         dp.message.register(on_broadcast_text, BroadcastFlow.waiting_text)
-        
+
         cleanup_task = asyncio.create_task(fsm_cleanup_task(fsm_storage))
-        
+
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             me = await bot.get_me()
@@ -1200,7 +1158,6 @@ async def main():
                 ], scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID))
             except Exception:
                 logging.warning("Не удалось установить команды администратора — продолжаю")
-                
             await dp.start_polling(bot)
         finally:
             cleanup_task.cancel()
