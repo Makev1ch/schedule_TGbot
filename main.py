@@ -20,7 +20,6 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -72,8 +71,8 @@ BTN_NEXT_WEEK = "⏭️ На следующую неделю"
 BTN_CHANGE_GROUP = "🔁 Изменить группу"
 BTN_REPORT = "🐞 Сообщить о проблеме"
 BTN_BACK = "⬅️ Назад"
-BTN_PAGE_PREV = "⬅️"
-BTN_PAGE_NEXT = "➡️"
+BTN_PAGE_PREV = "⬅️ Пред. страница"
+BTN_PAGE_NEXT = "➡️ След. страница"
 BTN_CANCEL = "❌ Отмена"
 BTN_TEACHER_SCHEDULE = "👨‍🏫 Расписание преподавателей"
 BTN_GROUP_SCHEDULE = "👥 Расписание группы"
@@ -112,6 +111,13 @@ MENU_KB_TEACHER = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+# ==================== ADMIN PANEL BUTTONS ====================
+BTN_ADM_BROADCAST = "📢 Рассылка всем"
+BTN_ADM_TOGGLE = "🧪 Тестовый режим"
+BTN_ADM_TEST_LIST = "👥 Тестовый список"
+BTN_ADM_ADD_ID = "➕ Добавить ID"
+BTN_ADM_CLOSE = "🚪 Выйти из панели"
+
 # ==================== FSM ====================
 class SetupFlow(StatesGroup):
     institute = State()
@@ -127,6 +133,11 @@ class TeacherFlow(StatesGroup):
 
 class BroadcastFlow(StatesGroup):
     waiting_text = State()
+
+class AdminPanel(StatesGroup):
+    menu = State()
+    test_list = State()
+    waiting_new_test_id = State()
 
 # ==================== MODELS ====================
 class Institute:
@@ -210,7 +221,7 @@ def _parse_date_from_string(date_str: str) -> Optional[date]:
         return None
 
 def _format_day_message(heading: str, lessons: List[Lesson]) -> str:
-    sep = "-------------------------"
+    sep = "------------------------------"
     out: List[str] = [f"🍌{html.escape(heading)}", sep]
     if not lessons:
         out.append("нет занятий")
@@ -247,7 +258,7 @@ def _format_day_message(heading: str, lessons: List[Lesson]) -> str:
     return "\n".join(out)
 
 def _format_day_message_teacher(heading: str, lessons: List[Lesson]) -> str:
-    sep = "-------------------------"
+    sep = "---------------------"
     out: List[str] = [f"🍌{html.escape(heading)}", sep]
     if not lessons:
         out.append("нет занятий")
@@ -315,6 +326,21 @@ def build_teacher_select_kb(teacher_names: List[str]) -> ReplyKeyboardMarkup:
     for name in teacher_names:
         keyboard.append([KeyboardButton(text=name)])
     keyboard.append([KeyboardButton(text=BTN_CANCEL)])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def build_admin_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=BTN_ADM_BROADCAST)],
+        [KeyboardButton(text=BTN_ADM_TOGGLE)],
+        [KeyboardButton(text=BTN_ADM_TEST_LIST)],
+        [KeyboardButton(text=BTN_ADM_CLOSE)],
+    ], resize_keyboard=True)
+
+
+def build_test_list_kb(users: list) -> ReplyKeyboardMarkup:
+    keyboard = [[KeyboardButton(text=f"❌ {label or uid}")] for uid, label in users]
+    keyboard.append([KeyboardButton(text=BTN_ADM_ADD_ID)])
+    keyboard.append([KeyboardButton(text=BTN_BACK)])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 # ==================== REFERENCE DATA CACHE ====================
@@ -647,6 +673,44 @@ async def import_users_from_file(db: Database, filepath: Path):
             except Exception:
                 errors += 1
     logging.info(f"Imported {count} user IDs from file ({errors} errors)")
+
+async def init_broadcast_test_table(db: Database):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_test_users (
+            user_id BIGINT PRIMARY KEY,
+            label VARCHAR(100) NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_config (
+            config_key VARCHAR(50) PRIMARY KEY,
+            config_value VARCHAR(255) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+async def get_test_mode(db: Database) -> bool:
+    row = await db.fetchone("SELECT config_value FROM bot_config WHERE config_key = 'test_mode'")
+    return bool(row and row[0] == "1")
+
+async def set_test_mode(db: Database, enabled: bool):
+    await db.execute("""
+        INSERT INTO bot_config (config_key, config_value) VALUES ('test_mode', %s)
+        ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)
+    """, ("1" if enabled else "0",))
+
+async def get_test_users(db: Database) -> list:
+    rows = await db.fetchall("SELECT user_id, label FROM broadcast_test_users ORDER BY added_at")
+    return [(r[0], r[1]) for r in (rows or [])]
+
+async def add_test_user(db: Database, user_id: int, label: Optional[str] = None):
+    await db.execute("""
+        INSERT INTO broadcast_test_users (user_id, label) VALUES (%s, %s)
+        ON DUPLICATE KEY UPDATE label = VALUES(label)
+    """, (user_id, label))
+
+async def remove_test_user(db: Database, user_id: int):
+    await db.execute("DELETE FROM broadcast_test_users WHERE user_id = %s", (user_id,))
 
 # ==================== HANDLERS ====================
 async def safe_request(message: Message, coro):
@@ -1032,62 +1096,163 @@ async def cmd_switch_to_teacher(message: Message, state: FSMContext, schedules: 
         await cmd_teacher_schedule(message, state)
 
 # ==================== ADMIN HANDLERS ====================
-async def cmd_broadcast(message: Message, state: FSMContext):
+async def _render_admin_menu(message: Message, db: Database):
+    test_mode = await get_test_mode(db)
+    test_count = len(await get_test_users(db))
+    if test_mode:
+        mode_line = "🧪 <b>Тестовый режим включён</b>\nРассылка уйдёт только тестовому списку (я по умолчанию)."
+    else:
+        mode_line = "⚠️ <b>Тестовый режим выключен</b>\nРассылка уйдёт всем пользователям бота."
+    await message.answer(
+        f"⚙️ <b>Админ-панель</b>\n\n{mode_line}\n\n👥 В тестовом списке: <b>{test_count}</b>",
+        reply_markup=build_admin_menu_kb()
+    )
+
+async def cmd_admin(message: Message, state: FSMContext, db: Database):
     if not message.from_user or message.from_user.id != ADMIN_USER_ID:
         return
-    await state.set_state(BroadcastFlow.waiting_text)
-    await message.answer("Введи текст для рассылки (HTML разметка поддерживается):", reply_markup=ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True
-    ))
+    await state.set_state(AdminPanel.menu)
+    await _render_admin_menu(message, db)
 
-async def on_broadcast_text(message: Message, state: FSMContext, bot: Bot, db: Database):
+async def on_admin_menu_button(message: Message, state: FSMContext, bot: Bot, db: Database):
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        return
+    text = message.text or ""
+
+    if text == BTN_ADM_CLOSE:
+        await state.clear()
+        await message.answer("Панель закрыта.", reply_markup=MENU_KB_GROUP)
+        return
+
+    if text == BTN_ADM_TOGGLE:
+        current = await get_test_mode(db)
+        await set_test_mode(db, not current)
+        await _render_admin_menu(message, db)
+        return
+
+    if text == BTN_ADM_TEST_LIST:
+        await state.set_state(AdminPanel.test_list)
+        users = await get_test_users(db)
+        await message.answer("Тестовый список получателей:", reply_markup=build_test_list_kb(users))
+        return
+
+    if text == BTN_ADM_BROADCAST:
+        await state.set_state(BroadcastFlow.waiting_text)
+        await message.answer(
+            "Введи текст для рассылки (форматирование и ссылки сохранятся как есть):",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True)
+        )
+        return
+
+    await message.answer("Выбери действие кнопкой снизу.")
+
+async def on_test_list_button(message: Message, state: FSMContext, db: Database):
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        return
+    text = message.text or ""
+
+    if text == BTN_BACK:
+        await state.set_state(AdminPanel.menu)
+        await _render_admin_menu(message, db)
+        return
+
+    if text == BTN_ADM_ADD_ID:
+        await state.set_state(AdminPanel.waiting_new_test_id)
+        await message.answer(
+            "Пришли user_id (число). Можно с подписью через пробел:\n123456789 Рекламодатель",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True)
+        )
+        return
+
+    if text.startswith("❌ "):
+        target = text[2:].strip()
+        for uid, label in await get_test_users(db):
+            if (label or str(uid)) == target:
+                await remove_test_user(db, uid)
+                break
+        users = await get_test_users(db)
+        await message.answer("Обновлено:", reply_markup=build_test_list_kb(users))
+        return
+
+    await message.answer("Выбери действие кнопкой снизу.")
+
+async def on_new_test_id(message: Message, state: FSMContext, db: Database):
     if not message.from_user or message.from_user.id != ADMIN_USER_ID:
         return
     if message.text == BTN_CANCEL:
-        await state.clear()
-        await message.answer("Рассылка отменена.", reply_markup=MENU_KB_GROUP)
+        await state.set_state(AdminPanel.test_list)
+        users = await get_test_users(db)
+        await message.answer("Добавление отменено.", reply_markup=build_test_list_kb(users))
         return
-    text = message.text or ""
-    if not text.strip():
-        await message.answer("Текст пустой. Введи снова или нажми Отмена.")
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if not parts or not parts[0].lstrip("-").isdigit():
+        await message.answer("Не похоже на ID. Пришли число, например: 123456789 Рекламодатель")
         return
-    await state.clear()
-    await message.answer("Начинаю рассылку...")
-    rows = await db.fetchall(
-        "SELECT user_id FROM registered_users WHERE user_id != %s",
-        (ADMIN_USER_ID,)
-    )
-    user_ids = [row[0] for row in rows] if rows else []
-    sent = 0
-    failed = 0
-    for uid in user_ids:
-        try:
-            await bot.send_message(uid, text)
-            sent += 1
-        except Exception as e:
-            failed += 1
-            logging.warning(f"Broadcast failed for {uid}: {e}")
-        await asyncio.sleep(0.05)
-    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}\nВсего пользователей: {len(user_ids)}", reply_markup=MENU_KB_GROUP)
+    uid = int(parts[0])
+    label = parts[1] if len(parts) > 1 else None
+    await add_test_user(db, uid, label)
+    await state.set_state(AdminPanel.test_list)
+    users = await get_test_users(db)
+    await message.answer(f"Добавлено: {label or uid}", reply_markup=build_test_list_kb(users))
 
-async def cmd_stats(message: Message, bot: Bot, db: Database, store: UserSettingsStore):
-    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
-        return
+async def _send_stats(bot: Bot, db: Database, chat_id: int):
     total_row = await db.fetchone("SELECT COUNT(*) FROM registered_users")
     total = total_row[0] if total_row else 0
-    await message.answer(f"<b>📊 Статистика бота</b>\nВсего пользователей: <b>{total}</b>")
+    await bot.send_message(chat_id, f"<b>📊 Статистика бота</b>\nВсего пользователей: <b>{total}</b>")
     all_rows = await db.fetchall("SELECT ru.user_id, us.group_title, us.course FROM registered_users ru LEFT JOIN user_settings us ON ru.user_id = us.user_id ORDER BY ru.user_id")
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["user_id", "group_name", "course"])
     for row in (all_rows or []):
-        user_id = row[0]
-        group_name = row[1] if row[1] is not None else ""
-        course = row[2] if row[2] is not None else ""
-        writer.writerow([user_id, group_name, course])
+        writer.writerow([row[0], row[1] if row[1] is not None else "", row[2] if row[2] is not None else ""])
     csv_bytes = output.getvalue().encode("utf-8-sig")
     filename = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    await bot.send_document(ADMIN_USER_ID, BufferedInputFile(csv_bytes, filename=filename))
+    await bot.send_document(chat_id, BufferedInputFile(csv_bytes, filename=filename))
+
+async def cmd_stats(message: Message, bot: Bot, db: Database):
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        return
+    await _send_stats(bot, db, message.chat.id)
+
+async def on_broadcast_text(message: Message, state: FSMContext, bot: Bot, db: Database):
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        return
+    if message.text == BTN_CANCEL:
+        await state.set_state(AdminPanel.menu)
+        await message.answer("Рассылка отменена.")
+        await _render_admin_menu(message, db)
+        return
+    text = message.text or ""
+    entities = message.entities
+    if not text.strip():
+        await message.answer("Текст пустой. Введи снова или нажми Отмена.")
+        return
+
+    test_mode = await get_test_mode(db)
+    if test_mode:
+        test_users = await get_test_users(db)
+        user_ids = [uid for uid, _ in test_users]
+        if ADMIN_USER_ID not in user_ids:
+            user_ids.append(ADMIN_USER_ID)
+        mode_note = "🧪ТЕСТОВЫЙ режим"
+    else:
+        rows = await db.fetchall("SELECT user_id FROM registered_users WHERE user_id != %s", (ADMIN_USER_ID,))
+        user_ids = [row[0] for row in rows] if rows else []
+        mode_note = "⚠️рассылка ВСЕМ"
+
+    await message.answer(f"Начинаю рассылку ({mode_note})...")
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, entities=entities, parse_mode=None)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logging.warning(f"Broadcast failed for {uid}: {e}")
+        await asyncio.sleep(0.05)
+    await message.answer(f"✅ Рассылка завершена ({mode_note}).\nОтправлено: {sent}\nОшибок: {failed}\nВсего получателей: {len(user_ids)}")
+    await state.set_state(AdminPanel.menu)
+    await _render_admin_menu(message, db)
 
 # ==================== FSM CLEANUP TASK ====================
 async def fsm_cleanup_task(fsm_storage: MySQLStorage):
@@ -1111,6 +1276,7 @@ async def main():
     store = UserSettingsStore(db)
     await store.initialize()
     await init_registered_users_table(db)
+    await init_broadcast_test_table(db)
     await import_users_from_file(db, USER_IDS_FILE)
     fsm_storage = MySQLStorage(db)
     await fsm_storage.initialize()
@@ -1139,8 +1305,11 @@ async def main():
         dp.message.register(cmd_switch_to_group, F.text == BTN_GROUP_SCHEDULE)
         dp.message.register(on_teacher_search, TeacherFlow.search)
         dp.message.register(on_teacher_select, TeacherFlow.select)
-        dp.message.register(cmd_broadcast, Command("broadcast"))
+        dp.message.register(cmd_admin, Command("admin"))
         dp.message.register(cmd_stats, Command("stats"))
+        dp.message.register(on_admin_menu_button, AdminPanel.menu)
+        dp.message.register(on_test_list_button, AdminPanel.test_list)
+        dp.message.register(on_new_test_id, AdminPanel.waiting_new_test_id)
         dp.message.register(on_broadcast_text, BroadcastFlow.waiting_text)
 
         cleanup_task = asyncio.create_task(fsm_cleanup_task(fsm_storage))
@@ -1153,7 +1322,7 @@ async def main():
             try:
                 await bot.set_my_commands([
                     BotCommand(command="start", description="Запустить бота"),
-                    BotCommand(command="broadcast", description="📢 Рассылка всем"),
+                    BotCommand(command="admin", description="⚙️ Админ-панель"),
                     BotCommand(command="stats", description="📊 Статистика + CSV"),
                 ], scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID))
             except Exception:
