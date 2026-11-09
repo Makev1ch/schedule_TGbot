@@ -9,6 +9,7 @@ import html
 import os
 import re
 import random
+import secrets
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Tuple, Dict
@@ -20,6 +21,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -45,6 +53,19 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
 REQUEST_TIMEOUT = 15.0
 FSM_CLEANUP_INTERVAL = 3 * 60 * 60  # 3 часа
+
+# Подтверждение рассылки действительно 10 минут.
+BROADCAST_CONFIRM_TTL_SECONDS = 10 * 60
+
+# Меняется при каждом запуске процесса: незавершённая рассылка
+# из старого процесса не сможет быть подтверждена после перезапуска.
+BROADCAST_SESSION_TOKEN = secrets.token_hex(16)
+
+# Защита от параллельного запуска рассылок.
+BROADCAST_LOCK = asyncio.Lock()
+
+# Защита от повторной обработки одного альбома
+_REJECTED_MEDIA_GROUPS: set[str] = set()
 
 # ==================== REGEX ====================
 RE_TIME = re.compile(r"^(\d{1,2}):(\d{2})$")
@@ -118,6 +139,9 @@ BTN_ADM_TEST_LIST = "👥 Тестовый список"
 BTN_ADM_ADD_ID = "➕ Добавить ID"
 BTN_ADM_CLOSE = "🚪 Выйти из панели"
 
+BTN_BROADCAST_CONFIRM = "✅ Да, отправить"
+BTN_BROADCAST_CANCEL = "❌ Нет, отменить"
+
 # ==================== FSM ====================
 class SetupFlow(StatesGroup):
     institute = State()
@@ -133,6 +157,7 @@ class TeacherFlow(StatesGroup):
 
 class BroadcastFlow(StatesGroup):
     waiting_text = State()
+    confirm = State()
 
 class AdminPanel(StatesGroup):
     menu = State()
@@ -1137,10 +1162,35 @@ async def on_admin_menu_button(message: Message, state: FSMContext, bot: Bot, db
         return
 
     if text == BTN_ADM_BROADCAST:
+        if BROADCAST_LOCK.locked():
+            await message.answer("⚠️ Рассылка уже выполняется. Дождись её завершения.")
+            return
+
+        # Сохраняем маркер текущего процесса. После перезапуска старый
+        # сценарий ожидания сообщения будет автоматически аннулирован.
+        await _clear_broadcast_data(state)
+        await state.update_data(
+            broadcast_session_token=BROADCAST_SESSION_TOKEN
+        )
         await state.set_state(BroadcastFlow.waiting_text)
+
         await message.answer(
-            "Введи текст для рассылки (форматирование и ссылки сохранятся как есть):",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CANCEL)]], resize_keyboard=True)
+            "Отправь одно сообщение для рассылки.\n\n"
+            "Поддерживаются:\n"
+            "• Текст\n"
+            "• Фото\n"
+            "• Видео\n"
+            "• GIF-анимации\n"
+            "• Документы\n"
+            "• Аудио и голосовые\n"
+            "• Видеосообщения (кружки)\n"
+            "• Стикеры\n"
+            "• Контакты и геолокация\n\n"
+            "Альбомы из нескольких файлов пока не поддерживаются.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
+                resize_keyboard=True
+            )
         )
         return
 
@@ -1214,45 +1264,376 @@ async def cmd_stats(message: Message, bot: Bot, db: Database):
         return
     await _send_stats(bot, db, message.chat.id)
 
-async def on_broadcast_text(message: Message, state: FSMContext, bot: Bot, db: Database):
+async def _clear_broadcast_data(state: FSMContext):
+    """Удаляет только временные данные рассылки, сохраняя остальные данные FSM."""
+    data = await state.get_data()
+    cleaned = {
+        key: value
+        for key, value in data.items()
+        if not key.startswith("broadcast_")
+    }
+    await state.set_data(cleaned)
+
+
+async def _copy_with_retry(
+    bot: Bot,
+    uid: int,
+    from_chat_id: int,
+    message_id: int,
+    reply_markup=None,
+    wait_after_rate_limit: bool = True
+) -> str:
+    max_attempts = 3
+
+    for attempt in range(max_attempts):
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                parse_mode=None,
+                reply_markup=reply_markup,
+            )
+            return "ok"
+
+        except TelegramRetryAfter as e:
+            # Ждём даже после последней неудачной попытки, чтобы не
+            # отправлять следующему получателю запрос сразу после 429.
+            delay = max(0.0, float(e.retry_after)) + 1.0
+            is_last_attempt = attempt == max_attempts - 1
+
+            if is_last_attempt:
+                if wait_after_rate_limit:
+                    logging.warning(
+                        f"Broadcast rate limit exhausted for {uid}; "
+                        f"waiting {delay:.1f}s before next recipient"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logging.warning(
+                        f"Broadcast rate limit exhausted for final recipient {uid}; "
+                        "no further recipient is waiting"
+                    )
+                return "rate_limited"
+
+            logging.warning(
+                f"Rate limit for {uid}. "
+                f"Retry {attempt + 1}/{max_attempts} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+
+        except TelegramForbiddenError as e:
+            logging.info(f"No access to user {uid}: {e}")
+            return "forbidden"
+
+        except (TelegramNetworkError, TelegramServerError) as e:
+            if attempt == max_attempts - 1:
+                logging.warning(
+                    f"Network/server error for {uid} "
+                    f"after {max_attempts} attempts: {e}"
+                )
+                return "error"
+
+            delay = min(RETRY_BASE_DELAY * (2 ** attempt), 10.0)
+            logging.warning(
+                f"Temporary error for {uid}. "
+                f"Retry {attempt + 1}/{max_attempts} "
+                f"in {delay:.1f}s: {e}"
+            )
+            await asyncio.sleep(delay)
+
+        except TelegramAPIError as e:
+            logging.warning(f"Telegram API error for {uid}: {e}")
+            return "error"
+
+        except Exception:
+            logging.exception(f"Unexpected broadcast error for {uid}")
+            return "error"
+
+    return "error"
+
+
+async def on_broadcast_text(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database
+):
     if not message.from_user or message.from_user.id != ADMIN_USER_ID:
         return
-    if message.text == BTN_CANCEL:
+
+    # Незавершённый сценарий из предыдущего процесса нельзя продолжать.
+    data = await state.get_data()
+    if data.get("broadcast_session_token") != BROADCAST_SESSION_TOKEN:
+        await _clear_broadcast_data(state)
         await state.set_state(AdminPanel.menu)
-        await message.answer("Рассылка отменена.")
+        await message.answer(
+            "⚠️ Предыдущая подготовка рассылки сброшена "
+            "после перезапуска бота. Начни заново через админ-панель."
+        )
         await _render_admin_menu(message, db)
         return
-    text = message.text or ""
-    entities = message.entities
-    if not text.strip():
-        await message.answer("Текст пустой. Введи снова или нажми Отмена.")
+
+    if BROADCAST_LOCK.locked():
+        await message.answer(
+            "⚠️ Рассылка уже выполняется. Дождись её завершения."
+        )
         return
 
+    # Отмена до этапа подтверждения.
+    if message.text in (BTN_CANCEL, BTN_BROADCAST_CANCEL):
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer("Подготовка рассылки отменена.")
+        await _render_admin_menu(message, db)
+        return
+
+    # Альбомы пока не поддерживаются: не допускаем отправку каждого
+    # элемента альбома как отдельной массовой рассылки.
+    if message.media_group_id:
+        group_id = message.media_group_id
+        if group_id not in _REJECTED_MEDIA_GROUPS:
+            _REJECTED_MEDIA_GROUPS.add(group_id)
+            await message.answer(
+                "⚠️ Альбомы пока не поддерживаются.\n"
+                "Отправь одну фотографию или один файл отдельно."
+            )
+            asyncio.get_running_loop().call_later(
+                60,
+                _REJECTED_MEDIA_GROUPS.discard,
+                group_id
+            )
+        return
+
+    has_copyable_content = bool(
+        (message.text or "").strip()
+        or (message.caption or "").strip()
+        or message.photo
+        or message.video
+        or message.animation
+        or message.document
+        or message.audio
+        or message.voice
+        or message.video_note
+        or message.sticker
+        or message.contact
+        or message.location
+        or message.venue
+        or message.dice
+    )
+
+    if not has_copyable_content:
+        await message.answer(
+            "Не удалось определить поддерживаемый тип сообщения.\n"
+            "Пришли текст, фото, видео, документ или другой "
+            "поддерживаемый тип сообщения."
+        )
+        return
+
+    # Фиксируем режим и точный список получателей на момент подготовки.
     test_mode = await get_test_mode(db)
+
     if test_mode:
         test_users = await get_test_users(db)
         user_ids = [uid for uid, _ in test_users]
         if ADMIN_USER_ID not in user_ids:
             user_ids.append(ADMIN_USER_ID)
-        mode_note = "🧪ТЕСТОВЫЙ режим"
+        mode_note = "🧪 ТЕСТОВЫЙ режим"
     else:
-        rows = await db.fetchall("SELECT user_id FROM registered_users WHERE user_id != %s", (ADMIN_USER_ID,))
+        rows = await db.fetchall(
+            "SELECT user_id FROM registered_users WHERE user_id != %s",
+            (ADMIN_USER_ID,)
+        )
         user_ids = [row[0] for row in rows] if rows else []
-        mode_note = "⚠️рассылка ВСЕМ"
+        mode_note = "⚠️ РАССЫЛКА ВСЕМ"
 
-    await message.answer(f"Начинаю рассылку ({mode_note})...")
-    sent, failed = 0, 0
-    for uid in user_ids:
+    # Убираем возможные дубликаты и нормализуем Telegram ID.
+    user_ids = list(dict.fromkeys(int(uid) for uid in user_ids))
+
+    if not user_ids:
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer("Список получателей пуст. Рассылка не запущена.")
+        await _render_admin_menu(message, db)
+        return
+
+    # Храним в FSM исходное сообщение и неизменяемый снимок получателей.
+    # Это исключает изменение аудитории между предпросмотром и подтверждением.
+    await state.update_data(
+        broadcast_session_token=BROADCAST_SESSION_TOKEN,
+        broadcast_created_at=datetime.now(timezone.utc).timestamp(),
+        broadcast_chat_id=message.chat.id,
+        broadcast_message_id=message.message_id,
+        broadcast_user_ids=user_ids,
+        broadcast_mode_note=mode_note,
+    )
+    await state.set_state(BroadcastFlow.confirm)
+
+    confirm_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_BROADCAST_CONFIRM)],
+            [KeyboardButton(text=BTN_BROADCAST_CANCEL)],
+        ],
+        resize_keyboard=True
+    )
+
+    await message.answer(
+        f"Проверь рассылку:\n\n"
+        f"Режим: {mode_note}\n"
+        f"Получателей: {len(user_ids)}\n\n"
+        f"Отправить это сообщение указанным получателям?",
+        reply_markup=confirm_keyboard
+    )
+
+
+async def on_broadcast_confirm(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database
+):
+    if not message.from_user or message.from_user.id != ADMIN_USER_ID:
+        return
+
+    # Пока рассылка выполняется, повторное подтверждение не запускает её снова.
+    if BROADCAST_LOCK.locked():
+        await message.answer("⏳ Рассылка уже выполняется. Дождись итогового отчёта.")
+        return
+
+    data = await state.get_data()
+
+    # Маркер создаётся при запуске процесса. После рестарта он меняется,
+    # поэтому старое подтверждение не может запустить массовую отправку.
+    if data.get("broadcast_session_token") != BROADCAST_SESSION_TOKEN:
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer(
+            "⚠️ Подтверждение рассылки аннулировано после перезапуска бота. "
+            "Подготовь рассылку заново."
+        )
+        await _render_admin_menu(message, db)
+        return
+
+    created_at = data.get("broadcast_created_at")
+    try:
+        age_seconds = datetime.now(timezone.utc).timestamp() - float(created_at)
+    except (TypeError, ValueError):
+        age_seconds = BROADCAST_CONFIRM_TTL_SECONDS + 1
+
+    if age_seconds < 0 or age_seconds > BROADCAST_CONFIRM_TTL_SECONDS:
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer(
+            "⌛ Время подтверждения истекло (10 минут). "
+            "Подготовь рассылку заново."
+        )
+        await _render_admin_menu(message, db)
+        return
+
+    if message.text in (BTN_BROADCAST_CANCEL, BTN_CANCEL):
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer("Рассылка отменена. Ничего не отправлено.")
+        await _render_admin_menu(message, db)
+        return
+
+    if message.text != BTN_BROADCAST_CONFIRM:
+        await message.answer(
+            "Рассылка пока не отправлена. Нажми «✅ Да, отправить» "
+            "для подтверждения или «❌ Нет, отменить» для отмены."
+        )
+        return
+
+    # Проверяем сохранённые параметры перед отправкой.
+    try:
+        from_chat_id = int(data["broadcast_chat_id"])
+        source_message_id = int(data["broadcast_message_id"])
+        user_ids = list(dict.fromkeys(
+            int(uid) for uid in data["broadcast_user_ids"]
+        ))
+        mode_note = str(data["broadcast_mode_note"])
+    except (KeyError, TypeError, ValueError):
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer(
+            "⚠️ Не удалось восстановить параметры рассылки. "
+            "Ничего не отправлено. Подготовь её заново."
+        )
+        await _render_admin_menu(message, db)
+        return
+
+    if not user_ids:
+        await _clear_broadcast_data(state)
+        await state.set_state(AdminPanel.menu)
+        await message.answer("Список получателей пуст. Рассылка не запущена.")
+        await _render_admin_menu(message, db)
+        return
+
+    # Проверка и захват блокировки выполняются без промежуточного await.
+    if BROADCAST_LOCK.locked():
+        await message.answer("⚠️ Другая рассылка уже выполняется.")
+        return
+    await BROADCAST_LOCK.acquire()
+
+    sent = 0
+    forbidden = 0
+    rate_limited = 0
+    failed = 0
+
+    try:
+        await message.answer(
+            f"🚀 Подтверждение принято. Начинаю рассылку ({mode_note}).\n"
+            f"Получателей: {len(user_ids)}"
+        )
+
+        for index, uid in enumerate(user_ids):
+            result = await _copy_with_retry(
+                bot,
+                uid,
+                from_chat_id,
+                source_message_id,
+                wait_after_rate_limit=(index < len(user_ids) - 1),
+            )
+
+            if result == "ok":
+                sent += 1
+            elif result == "forbidden":
+                forbidden += 1
+            elif result == "rate_limited":
+                rate_limited += 1
+            else:
+                failed += 1
+
+            await asyncio.sleep(0.05)
+
+        await message.answer(
+            f"✅ Рассылка завершена ({mode_note}).\n\n"
+            f"Доставлено: {sent}\n"
+            f"Нет доступа (403): {forbidden}\n"
+            f"Лимит Telegram (429): {rate_limited}\n"
+            f"Прочие ошибки: {failed}\n"
+            f"Всего получателей: {len(user_ids)}"
+        )
+
+    except Exception:
+        logging.exception("Broadcast process failed")
         try:
-            await bot.send_message(uid, text, entities=entities, parse_mode=None)
-            sent += 1
-        except Exception as e:
-            failed += 1
-            logging.warning(f"Broadcast failed for {uid}: {e}")
-        await asyncio.sleep(0.05)
-    await message.answer(f"✅ Рассылка завершена ({mode_note}).\nОтправлено: {sent}\nОшибок: {failed}\nВсего получателей: {len(user_ids)}")
-    await state.set_state(AdminPanel.menu)
+            await message.answer(
+                "⚠️ Рассылка была прервана из-за внутренней ошибки. "
+                "Проверь логи сервера и статистику доставки."
+            )
+        except Exception:
+            logging.exception("Failed to send broadcast interruption notice")
+
+    finally:
+        try:
+            await _clear_broadcast_data(state)
+            await state.set_state(AdminPanel.menu)
+        finally:
+            BROADCAST_LOCK.release()
+
     await _render_admin_menu(message, db)
+
 
 # ==================== FSM CLEANUP TASK ====================
 async def fsm_cleanup_task(fsm_storage: MySQLStorage):
@@ -1311,6 +1692,7 @@ async def main():
         dp.message.register(on_test_list_button, AdminPanel.test_list)
         dp.message.register(on_new_test_id, AdminPanel.waiting_new_test_id)
         dp.message.register(on_broadcast_text, BroadcastFlow.waiting_text)
+        dp.message.register(on_broadcast_confirm, BroadcastFlow.confirm)
 
         cleanup_task = asyncio.create_task(fsm_cleanup_task(fsm_storage))
 
